@@ -2,7 +2,6 @@
 // SPDX-License-Identifier: Apache-2.0
 import { Alert } from '@mantine/core';
 import { showNotification } from '@mantine/notifications';
-import { normalizeErrorString } from '@medplum/core';
 import type { Questionnaire, QuestionnaireItem, QuestionnaireResponse } from '@medplum/fhirtypes';
 import {
   AIRealTimeQuestionnaireForm,
@@ -13,9 +12,10 @@ import {
   useValueSetAvailabilities,
 } from '@medplum/react';
 import type { JSX } from 'react';
-import { useCallback, useMemo } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate } from 'react-router';
 import { onboardPatient } from '../../utils/intake-form';
+import { IntakeSaveError, IntakeValidationError } from '../../utils/intake-validation';
 
 const voiceInstructions = (
   <ul>
@@ -47,6 +47,21 @@ export function IntakeFormPage({
   const medplum = useMedplum();
   const profile = useMedplumProfile();
   const questionnaire = propQuestionnaire ?? defaultQuestionnaire;
+  const [errors, setErrors] = useState<string[]>([]);
+  const saving = useRef(false);
+  const formContainer = useRef<HTMLDivElement>(null);
+  const clearFieldErrors = useCallback(() => {
+    for (const input of formContainer.current?.querySelectorAll<HTMLInputElement>('input, select, textarea') ?? []) {
+      input.setCustomValidity('');
+    }
+  }, []);
+  const errorSummary = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (errors.length) {
+      errorSummary.current?.focus({ preventScroll: true });
+      errorSummary.current?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    }
+  }, [errors]);
 
   // Every value set referenced by the questionnaire, deduplicated by URL (keeping the first
   // question that referenced it, for the "unavailable" list below).
@@ -68,21 +83,65 @@ export function IntakeFormPage({
 
   const handleOnSubmit = useCallback(
     async (response: QuestionnaireResponse) => {
-      if (!questionnaire || !profile) {
+      if (!questionnaire || !profile || saving.current) {
         return;
       }
+      saving.current = true;
+      clearFieldErrors();
+      setErrors([]);
       try {
         const patient = await onboardPatient(medplum, questionnaire, response);
         navigate(`/Patient/${patient.id}/timeline`)?.catch(console.error);
       } catch (error) {
+        console.error('Patient intake submission failed', error);
+        if (error instanceof IntakeValidationError && error.targets.length) {
+          let firstInvalid: HTMLInputElement | undefined;
+          for (const target of error.targets) {
+            const inputs = Array.from(
+              formContainer.current?.querySelectorAll<HTMLInputElement>('input, select, textarea') ?? []
+            ).filter((input) => input.id === target.linkId && input.type !== 'hidden' && !input.disabled);
+            const label = Array.from(formContainer.current?.querySelectorAll('label') ?? []).filter(
+              (label) => label.htmlFor === target.linkId
+            )[target.index];
+            const input =
+              inputs[target.index] ??
+              label?.parentElement?.querySelector<HTMLInputElement>('input:not([type="hidden"]), select, textarea') ??
+              undefined;
+            if (input) {
+              input.setCustomValidity('Please complete this required field.');
+              firstInvalid ??= input;
+            }
+          }
+          if (firstInvalid) {
+            firstInvalid.scrollIntoView({ behavior: 'smooth', block: 'center' });
+            firstInvalid.focus();
+            firstInvalid.reportValidity();
+            return;
+          }
+        }
+        const messages =
+          error instanceof IntakeValidationError
+            ? error.fields.map((field) => field + ': Please complete this required field.')
+            : [
+                error instanceof IntakeSaveError
+                  ? error.message
+                  : 'We could not complete this form. Your answers are still here. Review them and contact support if the problem continues.',
+              ];
+        setErrors(messages);
         showNotification({
           color: 'red',
-          message: normalizeErrorString(error),
+          title: 'Submission could not be completed',
+          message:
+            error instanceof IntakeValidationError
+              ? 'Please correct the fields listed at the top of the form. Nothing was saved.'
+              : messages[0],
           autoClose: false,
         });
+      } finally {
+        saving.current = false;
       }
     },
-    [medplum, navigate, profile, questionnaire]
+    [medplum, navigate, profile, questionnaire, clearFieldErrors]
   );
 
   return (
@@ -101,11 +160,24 @@ export function IntakeFormPage({
           </ul>
         </Alert>
       )}
-      <AIRealTimeQuestionnaireForm
-        questionnaire={questionnaire}
-        onSubmit={handleOnSubmit}
-        voiceInstructions={voiceInstructions}
-      />
+      <div ref={errorSummary} tabIndex={-1}>
+        {errors.length > 0 && (
+          <Alert color="red" title="Please review your submission" mb="md">
+            <ul>
+              {errors.map((error) => (
+                <li key={error}>{error}</li>
+              ))}
+            </ul>
+          </Alert>
+        )}
+      </div>
+      <div ref={formContainer} onChangeCapture={clearFieldErrors}>
+        <AIRealTimeQuestionnaireForm
+          questionnaire={questionnaire}
+          onSubmit={handleOnSubmit}
+          voiceInstructions={voiceInstructions}
+        />
+      </div>
     </Document>
   );
 }

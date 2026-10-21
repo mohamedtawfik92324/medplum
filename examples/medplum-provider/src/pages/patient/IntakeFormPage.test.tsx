@@ -6,10 +6,11 @@ import { badRequest, OperationOutcomeError, serverError } from '@medplum/core';
 import type { Questionnaire } from '@medplum/fhirtypes';
 import { MockClient } from '@medplum/mock';
 import { MedplumProvider } from '@medplum/react';
-import { act, cleanup, render, screen, waitFor } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import * as reactRouter from 'react-router';
 import { MemoryRouter, Route, Routes } from 'react-router';
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest';
+import * as intakeForm from '../../utils/intake-form';
 import { IntakeFormPage } from './IntakeFormPage';
 
 const simpleQuestionnaire: Questionnaire = {
@@ -134,6 +135,51 @@ describe('IntakeFormPage', () => {
       },
       { timeout: 10000 }
     );
+  });
+
+  test('focuses the first missing field using native validation without saving or losing answers', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    const createSpy = vi.spyOn(medplum, 'createResource');
+    const batchSpy = vi.spyOn(medplum, 'executeBatch');
+    await setup(true, simpleQuestionnaire);
+    await screen.findByText('Simple Test Questionnaire');
+    const firstName = screen.getAllByRole('textbox', { name: /First Name/i })[0];
+    fireEvent.change(firstName, { target: { value: 'Keep my answer' } });
+    fireEvent.submit(screen.getByTestId('questionnaire-form'));
+    const lastName = screen.getAllByRole('textbox', { name: /Last Name/i })[0] as HTMLInputElement;
+    await waitFor(() => expect(lastName).toHaveFocus());
+    expect(lastName.validationMessage).toBe('Please complete this required field.');
+    expect(screen.queryByText('Please review your submission')).not.toBeInTheDocument();
+    fireEvent.change(lastName, { target: { value: 'Corrected' } });
+    expect(lastName.validationMessage).toBe('');
+    expect(screen.getAllByRole('textbox', { name: /First Name/i })[0]).toHaveValue('Keep my answer');
+    expect(createSpy).not.toHaveBeenCalled();
+    expect(batchSpy).not.toHaveBeenCalled();
+    expect(navigateSpy).not.toHaveBeenCalled();
+  });
+
+  test('blocks duplicate submissions and replaces unexpected technical errors with useful guidance', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    let rejectSave: (error: Error) => void = () => {};
+    const submitSpy = vi.spyOn(intakeForm, 'onboardPatient').mockImplementationOnce(
+      () =>
+        new Promise((_resolve, reject) => {
+          rejectSave = reject;
+        })
+    );
+    await setup(true, simpleQuestionnaire);
+    await screen.findByText('Simple Test Questionnaire');
+    const form = screen.getByTestId('questionnaire-form');
+    fireEvent.submit(form);
+    fireEvent.submit(form);
+    expect(submitSpy).toHaveBeenCalledTimes(1);
+    await act(async () => rejectSave(new TypeError("Cannot read properties of undefined (reading 'code')")));
+    await screen.findByText(
+      'We could not complete this form. Your answers are still here. Review them and contact support if the problem continues.',
+      { selector: 'li' }
+    );
+    expect(screen.queryByText(/Cannot read properties/)).not.toBeInTheDocument();
+    expect(navigateSpy).not.toHaveBeenCalled();
   });
 
   test('Shows alert when value sets are unavailable', async () => {

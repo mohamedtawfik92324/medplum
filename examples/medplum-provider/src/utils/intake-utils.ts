@@ -1,6 +1,5 @@
 // SPDX-FileCopyrightText: Copyright Orangebot, Inc. and Medplum contributors
 // SPDX-License-Identifier: Apache-2.0
-import type { MedplumClient } from '@medplum/core';
 import {
   addProfileToResource,
   createReference,
@@ -26,6 +25,8 @@ import type {
   QuestionnaireResponseItemAnswer,
   Reference,
 } from '@medplum/fhirtypes';
+import type { IntakeWriter } from './intake-transaction';
+import { IntakeValidationError } from './intake-validation';
 
 export const PROFILE_URLS: Record<string, string> = {
   AllergyIntolerance: `${HTTP_HL7_ORG}/fhir/us/core/StructureDefinition/us-core-allergyintolerance`,
@@ -197,7 +198,7 @@ type ObservationQuestionnaireItemType = 'valueCodeableConcept' | 'valueDateTime'
  * @param profileUrl - An optional profile URL to be added to the resource
  */
 export async function upsertObservation(
-  medplum: MedplumClient,
+  medplum: IntakeWriter,
   patient: Patient,
   code: CodeableConcept,
   category: CodeableConcept,
@@ -335,7 +336,7 @@ export function addLanguage(patient: Patient, valueCoding: Coding | undefined, p
  * @param answers - A list of objects where the keys are the linkIds of the fields used to set up an
  */
 export async function addAllergy(
-  medplum: MedplumClient,
+  medplum: IntakeWriter,
   patient: Patient,
   answers: Record<string, QuestionnaireResponseItemAnswer>
 ): Promise<void> {
@@ -395,7 +396,7 @@ export async function addAllergy(
  *                 medication (see getGroupRepeatedAnswers)
  */
 export async function addMedication(
-  medplum: MedplumClient,
+  medplum: IntakeWriter,
   patient: Patient,
   answers: Record<string, QuestionnaireResponseItemAnswer>
 ): Promise<void> {
@@ -436,7 +437,7 @@ export async function addMedication(
  *                 condition (see getGroupRepeatedAnswers)
  */
 export async function addCondition(
-  medplum: MedplumClient,
+  medplum: IntakeWriter,
   patient: Patient,
   answers: Record<string, QuestionnaireResponseItemAnswer>
 ): Promise<void> {
@@ -473,7 +474,7 @@ export async function addCondition(
  *                 family member history (see getGroupRepeatedAnswers)
  */
 export async function addFamilyMemberHistory(
-  medplum: MedplumClient,
+  medplum: IntakeWriter,
   patient: Patient,
   answers: Record<string, QuestionnaireResponseItemAnswer>
 ): Promise<void> {
@@ -511,7 +512,7 @@ export async function addFamilyMemberHistory(
  *                  immunization (see getGroupRepeatedAnswers)
  */
 export async function addImmunization(
-  medplum: MedplumClient,
+  medplum: IntakeWriter,
   patient: Patient,
   answers: Record<string, QuestionnaireResponseItemAnswer>
 ): Promise<void> {
@@ -550,7 +551,7 @@ export async function addImmunization(
  * @param pharmacy - The pharmacy to be added to the care team
  */
 export async function addPharmacy(
-  medplum: MedplumClient,
+  medplum: IntakeWriter,
   patient: Patient,
   pharmacy: Reference<Organization>
 ): Promise<void> {
@@ -586,10 +587,18 @@ export async function addPharmacy(
  *                  coverage (see getGroupRepeatedAnswers)
  */
 export async function addCoverage(
-  medplum: MedplumClient,
+  medplum: IntakeWriter,
   patient: Patient,
   answers: Record<string, QuestionnaireResponseItemAnswer>
 ): Promise<void> {
+  const missing = [
+    !answers['insurance-provider']?.valueReference?.reference && 'Insurance Provider',
+    !answers['subscriber-id']?.valueString?.trim() && 'Subscriber ID',
+    !answers['relationship-to-subscriber']?.valueCoding?.code && 'Relationship to Subscriber',
+  ].filter((field): field is string => !!field);
+  if (missing.length) {
+    throw new IntakeValidationError(missing.map((field) => 'Coverage Information → ' + field));
+  }
   const payor = answers['insurance-provider'].valueReference as Reference<Organization>;
   const subscriberId = answers['subscriber-id'].valueString;
   const relationshipToSubscriber = answers['relationship-to-subscriber'].valueCoding as Coding;
@@ -635,7 +644,7 @@ export async function addCoverage(
 }
 
 export async function addConsent(
-  medplum: MedplumClient,
+  medplum: IntakeWriter,
   patient: Patient,
   consentGiven: boolean,
   scope: CodeableConcept,
@@ -702,7 +711,7 @@ export function getGroupRepeatedAnswers(
   // Find the questionnaire item based on groupLinkId
   const questionnaireItem = findQuestionnaireItem(questionnaire.item, groupLinkId) as QuestionnaireItem;
 
-  if (questionnaireItem.type !== 'group' || !questionnaireItem?.item) {
+  if (questionnaireItem?.type !== 'group' || !questionnaireItem.item) {
     return [];
   }
 

@@ -1,6 +1,12 @@
 // SPDX-FileCopyrightText: Copyright Orangebot, Inc. and Medplum contributors
 // SPDX-License-Identifier: Apache-2.0
-import type { Questionnaire, QuestionnaireResponse, QuestionnaireResponseItemAnswer } from '@medplum/fhirtypes';
+import { allOk, badRequest, OperationOutcomeError, serverError } from '@medplum/core';
+import type {
+  Patient,
+  Questionnaire,
+  QuestionnaireResponse,
+  QuestionnaireResponseItemAnswer,
+} from '@medplum/fhirtypes';
 import { MockClient } from '@medplum/mock';
 import { beforeEach, describe, expect, test, vi } from 'vitest';
 
@@ -110,15 +116,42 @@ describe('onboardPatient', () => {
   beforeEach(() => {
     medplum = new MockClient();
     vi.clearAllMocks();
+    vi.spyOn(medplum, 'validateResource').mockResolvedValue(allOk);
+    vi.spyOn(medplum, 'getProject').mockReturnValue({ resourceType: 'Project', features: ['transaction-bundles'] });
+    vi.spyOn(medplum, 'executeBatch').mockImplementation(async (bundle) => ({
+      resourceType: 'Bundle',
+      type: 'transaction-response',
+      entry: bundle.entry?.map((entry, index) => ({
+        resource: { ...entry.resource, id: index === 0 ? 'patient-1' : 'response-1' } as Patient,
+        response: { status: '201' },
+      })),
+    }));
+  });
+
+  test.each(['outcome', 'rejection'])('does not write resources on validation %s', async (failure) => {
+    const response = buildResponseFromAnswers({ 'insurance-provider': {} });
+    const outcome = badRequest('Invalid empty non-primitive value (QuestionnaireResponse.item[0].answer[0])');
+    const error = new OperationOutcomeError(outcome);
+    if (failure === 'outcome') {
+      vi.mocked(medplum.validateResource).mockResolvedValue(outcome);
+    } else {
+      vi.mocked(medplum.validateResource).mockRejectedValue(error);
+    }
+    const createSpy = vi.spyOn(medplum, 'createResource');
+    const upsertSpy = vi.spyOn(medplum, 'upsertResource');
+
+    await expect(onboardPatient(medplum, { resourceType: 'Questionnaire' } as Questionnaire, response)).rejects.toThrow(
+      error.message
+    );
+
+    expect(medplum.validateResource).toHaveBeenCalledWith(response);
+    expect(createSpy).not.toHaveBeenCalled();
+    expect(upsertSpy).not.toHaveBeenCalled();
+    expect(mockIntakeUtils.getHumanName).not.toHaveBeenCalled();
   });
 
   test('creates patient and invokes onboarding helpers', async () => {
-    const createSpy = vi.spyOn(medplum, 'createResource').mockImplementation(async (resource: any) => {
-      if (resource.resourceType === 'Patient') {
-        return { ...resource, id: 'patient-1' };
-      }
-      return resource;
-    });
+    const createSpy = vi.spyOn(medplum, 'createResource');
 
     const questionnaire = { resourceType: 'Questionnaire' } as Questionnaire;
     const response = buildResponseFromAnswers(mockAnswers);
@@ -126,7 +159,13 @@ describe('onboardPatient', () => {
     const patient = await onboardPatient(medplum, questionnaire, response);
 
     expect(patient.id).toBe('patient-1');
-    expect(createSpy).toHaveBeenCalledWith(expect.objectContaining({ resourceType: 'Patient' }));
+    expect(response.subject).toBeUndefined();
+    expect(medplum.validateResource).toHaveBeenCalledWith(response);
+    expect(createSpy).not.toHaveBeenCalled();
+    const bundle = vi.mocked(medplum.executeBatch).mock.calls[0][0];
+    expect(bundle.type).toBe('transaction');
+    expect(bundle.entry?.map((entry) => entry.resource?.resourceType)).toEqual(['Patient', 'QuestionnaireResponse']);
+    expect((bundle.entry?.[1]?.resource as QuestionnaireResponse).subject?.reference).toBe(bundle.entry?.[0]?.fullUrl);
     expect(mockIntakeUtils.addExtension).toHaveBeenCalledWith(
       expect.objectContaining({}),
       'race-url',
@@ -135,10 +174,54 @@ describe('onboardPatient', () => {
       'ombCategory'
     );
     expect(mockIntakeUtils.addLanguage).toHaveBeenCalledTimes(2);
-    expect(mockIntakeUtils.addCoverage).toHaveBeenCalledWith(medplum, patient, expect.any(Object));
+    expect(mockIntakeUtils.addCoverage).toHaveBeenCalledWith(
+      expect.objectContaining({ createResource: expect.any(Function), upsertResource: expect.any(Function) }),
+      expect.objectContaining({ resourceType: 'Patient' }),
+      expect.any(Object)
+    );
     expect(mockIntakeUtils.addAllergy).toHaveBeenCalled();
     expect(mockIntakeUtils.addConsent).toHaveBeenCalled();
     expect(mockIntakeUtils.addPharmacy).toHaveBeenCalled();
+  });
+
+  test('refuses to send any writes when transactions are unavailable', async () => {
+    vi.mocked(medplum.getProject).mockReturnValue({ resourceType: 'Project' });
+    await expect(
+      onboardPatient(medplum, { resourceType: 'Questionnaire' } as Questionnaire, buildResponseFromAnswers(mockAnswers))
+    ).rejects.toThrow('Safe intake saving is unavailable');
+    expect(medplum.executeBatch).not.toHaveBeenCalled();
+  });
+
+  test('a helper failure during preparation cannot save a patient', async () => {
+    mockIntakeUtils.addCoverage.mockRejectedValueOnce(new Error('preparation failed'));
+    const createSpy = vi.spyOn(medplum, 'createResource');
+    await expect(
+      onboardPatient(medplum, { resourceType: 'Questionnaire' } as Questionnaire, buildResponseFromAnswers(mockAnswers))
+    ).rejects.toThrow('preparation failed');
+    expect(createSpy).not.toHaveBeenCalled();
+    expect(medplum.executeBatch).not.toHaveBeenCalled();
+  });
+
+  test.each([
+    [new OperationOutcomeError(badRequest('Invalid Coverage')), 'Nothing was saved'],
+    [
+      new OperationOutcomeError(serverError(new Error('Internal failure'))),
+      'Check the patient list before trying again',
+    ],
+    [new Error('Failed to fetch'), 'Check the patient list before trying again'],
+  ])('distinguishes a rejected transaction from an uncertain connection failure', async (error, message) => {
+    vi.mocked(medplum.executeBatch).mockRejectedValueOnce(error);
+    await expect(
+      onboardPatient(medplum, { resourceType: 'Questionnaire' } as Questionnaire, buildResponseFromAnswers(mockAnswers))
+    ).rejects.toThrow(message);
+    expect(medplum.executeBatch).toHaveBeenCalledTimes(1);
+  });
+
+  test('does not report success for an unexpected transaction response', async () => {
+    vi.mocked(medplum.executeBatch).mockResolvedValueOnce({ resourceType: 'Bundle', type: 'batch-response' });
+    await expect(
+      onboardPatient(medplum, { resourceType: 'Questionnaire' } as Questionnaire, buildResponseFromAnswers(mockAnswers))
+    ).rejects.toThrow('Check the patient list before trying again');
   });
 });
 

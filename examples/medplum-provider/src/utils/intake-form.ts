@@ -1,8 +1,19 @@
 // SPDX-FileCopyrightText: Copyright Orangebot, Inc. and Medplum contributors
 // SPDX-License-Identifier: Apache-2.0
 import type { MedplumClient } from '@medplum/core';
-import { addProfileToResource, append, createReference, EMPTY, getQuestionnaireAnswers } from '@medplum/core';
+import {
+  addProfileToResource,
+  append,
+  createReference,
+  EMPTY,
+  getQuestionnaireAnswers,
+  getStatus,
+  isOk,
+  OperationOutcomeError,
+} from '@medplum/core';
 import type { Organization, Patient, Questionnaire, QuestionnaireResponse, Reference } from '@medplum/fhirtypes';
+import type { IntakeWriter } from './intake-transaction';
+import { createIntakeTransaction } from './intake-transaction';
 import {
   addAllergy,
   addCondition,
@@ -27,9 +38,65 @@ import {
   PROFILE_URLS,
   upsertObservation,
 } from './intake-utils';
+import { IntakeSaveError, validateIntakeResponse } from './intake-validation';
 
 export async function onboardPatient(
   medplum: MedplumClient,
+  questionnaire: Questionnaire,
+  response: QuestionnaireResponse
+): Promise<Patient> {
+  validateIntakeResponse(questionnaire, response);
+  const outcome = await medplum.validateResource(response);
+  if (!isOk(outcome)) {
+    throw new OperationOutcomeError(outcome);
+  }
+
+  if (!medplum.getProject()?.features?.includes('transaction-bundles')) {
+    throw new IntakeSaveError(
+      'Nothing was saved. Safe intake saving is unavailable for this project. Ask your administrator to enable transaction bundles.'
+    );
+  }
+
+  const transaction = createIntakeTransaction(medplum);
+  await buildIntakeResources(transaction.writer, questionnaire, { ...response });
+  let result;
+  try {
+    result = await medplum.executeBatch(transaction.build());
+  } catch (error) {
+    if (
+      error instanceof OperationOutcomeError &&
+      getStatus(error.outcome) >= 400 &&
+      getStatus(error.outcome) < 500 &&
+      getStatus(error.outcome) !== 408
+    ) {
+      throw new IntakeSaveError(
+        'The server rejected this submission. Nothing was saved. Review your answers or contact support.',
+        { cause: error }
+      );
+    }
+    throw new IntakeSaveError(
+      "We couldn't confirm whether your submission was saved. Check the patient list before trying again.",
+      { cause: error }
+    );
+  }
+  const entries = result.entry;
+  const patient = entries?.[0]?.resource;
+  if (
+    result.type !== 'transaction-response' ||
+    !entries?.length ||
+    entries.some((entry) => !/^2\d\d\b/.test(entry.response?.status ?? '')) ||
+    patient?.resourceType !== 'Patient' ||
+    !patient.id
+  ) {
+    throw new IntakeSaveError(
+      "We couldn't confirm whether your submission was saved. Check the patient list before trying again."
+    );
+  }
+  return patient;
+}
+
+async function buildIntakeResources(
+  medplum: IntakeWriter,
   questionnaire: Questionnaire,
   response: QuestionnaireResponse
 ): Promise<Patient> {

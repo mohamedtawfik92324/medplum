@@ -825,7 +825,7 @@ describe('intake utils', () => {
       expect(upsertSpy).toHaveBeenCalled();
     });
 
-    test('addCoverage does not create RelatedPerson when relationship code is missing', async () => {
+    test('addCoverage rejects a missing relationship before writing anything', async () => {
       const createSpy = vi.spyOn(medplum, 'createResource');
       const upsertSpy = vi.spyOn(medplum, 'upsertResource').mockResolvedValue({} as any);
       const answers: Record<string, QuestionnaireResponseItemAnswer> = {
@@ -834,10 +834,12 @@ describe('intake utils', () => {
         'relationship-to-subscriber': { valueCoding: { system: 'http://example.com' } },
       };
 
-      await addCoverage(medplum, patient, answers);
+      await expect(addCoverage(medplum, patient, answers)).rejects.toThrow(
+        'Coverage Information → Relationship to Subscriber'
+      );
 
       expect(createSpy).not.toHaveBeenCalled();
-      expect(upsertSpy).toHaveBeenCalled();
+      expect(upsertSpy).not.toHaveBeenCalled();
     });
 
     test('addCoverage does not create RelatedPerson when relatedPersonAnswers is missing', async () => {
